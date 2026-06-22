@@ -1,6 +1,8 @@
 import asyncio
 import json
+import logging
 import re
+import time
 
 from google import genai
 from google.genai import types
@@ -13,7 +15,25 @@ from tenacity import (
 )
 
 from config import settings
-from models.schemas import EvalRequest, EvalResponse, MetricScore
+from models.schemas import EvalRequest, EvalResponse, MetricScore, Usage
+
+logger = logging.getLogger("evaluator")
+
+# Approximate Gemini pricing in USD per 1M tokens: (input, output).
+# Source: Google AI pricing; update as needed. Keys are matched as substrings.
+_PRICING: dict[str, tuple[float, float]] = {
+    "gemini-2.0-flash": (0.10, 0.40),
+    "gemini-1.5-flash": (0.075, 0.30),
+    "gemini-1.5-pro": (1.25, 5.00),
+    "gemini-flash-latest": (0.10, 0.40),
+}
+
+
+def _estimate_cost(model: str, prompt_tokens: int, output_tokens: int) -> float | None:
+    for key, (in_rate, out_rate) in _PRICING.items():
+        if key in model:
+            return round(prompt_tokens / 1e6 * in_rate + output_tokens / 1e6 * out_rate, 6)
+    return None
 
 SYSTEM_PROMPT = """You are an impartial AI quality evaluator acting as a strict judge.
 Your sole job is to score LLM responses on the requested metrics.
@@ -76,7 +96,7 @@ class EvaluatorService:
             llm_response=request.llm_response,
         )
 
-    async def _generate(self, user_msg: str) -> str:
+    async def _generate(self, user_msg: str):
         """Call Gemini with a per-attempt timeout and exponential-backoff retries."""
         async for attempt in AsyncRetrying(
             stop=stop_after_attempt(settings.max_retries),
@@ -85,7 +105,7 @@ class EvaluatorService:
             reraise=True,
         ):
             with attempt:
-                response = await asyncio.wait_for(
+                return await asyncio.wait_for(
                     self._client.aio.models.generate_content(
                         model=settings.model_id,
                         contents=user_msg,
@@ -98,8 +118,26 @@ class EvaluatorService:
                     ),
                     timeout=settings.request_timeout,
                 )
-                return response.text
         raise RuntimeError("unreachable")  # AsyncRetrying always returns or raises
+
+    @staticmethod
+    def _build_usage(response, latency_ms: float) -> Usage:
+        """Extract token counts + cost from the Gemini response (defensive on shape)."""
+        try:
+            um = response.usage_metadata
+            prompt_tokens = int(um.prompt_token_count)
+            output_tokens = int(um.candidates_token_count)
+            total_tokens = int(um.total_token_count)
+        except (AttributeError, TypeError, ValueError):
+            return Usage(model=settings.model_id, latency_ms=latency_ms)
+        return Usage(
+            model=settings.model_id,
+            latency_ms=latency_ms,
+            prompt_tokens=prompt_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+            cost_usd=_estimate_cost(settings.model_id, prompt_tokens, output_tokens),
+        )
 
     def _parse_response(self, raw: str, requested_metrics: list[str]) -> EvalResponse:
         data = _JudgeOutput.model_validate_json(_strip_markdown_fences(raw))
@@ -115,16 +153,35 @@ class EvaluatorService:
         )
 
     async def evaluate(self, request: EvalRequest) -> EvalResponse:
+        start = time.monotonic()
         try:
-            raw = await self._generate(self._build_user_message(request))
-            return self._parse_response(raw, request.eval_metrics)
+            response = await self._generate(self._build_user_message(request))
+            latency_ms = round((time.monotonic() - start) * 1000, 1)
+            result = self._parse_response(response.text, request.eval_metrics)
+            result.usage = self._build_usage(response, latency_ms)
+            logger.info(
+                "evaluation complete",
+                extra={
+                    "event": "evaluation",
+                    "app_id": request.app_id,
+                    "model": result.usage.model,
+                    "prompt_tokens": result.usage.prompt_tokens,
+                    "output_tokens": result.usage.output_tokens,
+                    "total_tokens": result.usage.total_tokens,
+                    "cost_usd": result.usage.cost_usd,
+                    "latency_ms": result.usage.latency_ms,
+                },
+            )
+            return result
         except (json.JSONDecodeError, ValidationError) as exc:
+            logger.warning("evaluation parse failure", extra={"event": "evaluation_error", "app_id": request.app_id})
             return EvalResponse(
                 status="error",
                 scores={},
                 reasoning=f"Evaluator returned malformed JSON: {exc}",
             )
         except Exception as exc:
+            logger.error("evaluation failed", extra={"event": "evaluation_error", "app_id": request.app_id}, exc_info=True)
             return EvalResponse(
                 status="error",
                 scores={},

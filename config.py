@@ -18,6 +18,10 @@ class Settings(BaseSettings):
     # Per-key request limit for the expensive /evaluate endpoint.
     rate_limit: str = "60/minute"
 
+    # Observability
+    log_level: str = "INFO"
+    sentry_dsn: str = ""  # set to enable Sentry error tracking
+
     @property
     def valid_api_keys(self) -> set[str]:
         return {k.strip() for k in self.api_keys.split(",") if k.strip()}

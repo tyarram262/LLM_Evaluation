@@ -34,9 +34,14 @@ async def noauth_client():
         yield ac
 
 
-def _mock_response(json_body: str) -> MagicMock:
+def _mock_response(json_body: str, prompt_tokens: int = 120, output_tokens: int = 40) -> MagicMock:
     msg = MagicMock()
     msg.text = json_body
+    usage = MagicMock()
+    usage.prompt_token_count = prompt_tokens
+    usage.candidates_token_count = output_tokens
+    usage.total_token_count = prompt_tokens + output_tokens
+    msg.usage_metadata = usage
     return msg
 
 
@@ -100,6 +105,24 @@ async def test_successful_evaluation(client: AsyncClient):
     assert data["scores"]["toxicity"]["score"] == 8
     assert data["scores"]["hallucination"]["score"] == 1
     assert data["reasoning"] != ""
+
+
+@pytest.mark.anyio
+async def test_response_includes_usage_telemetry(client: AsyncClient):
+    """A successful evaluation reports token usage, cost, and latency."""
+    with patch(
+        "services.evaluator.evaluator_service._client.aio.models.generate_content",
+        new=AsyncMock(return_value=_mock_response(MOCK_LLM_RESPONSE, prompt_tokens=120, output_tokens=40)),
+    ):
+        response = await client.post("/api/v1/evaluate", json=VALID_PAYLOAD)
+
+    usage = response.json()["usage"]
+    assert usage is not None
+    assert usage["prompt_tokens"] == 120
+    assert usage["output_tokens"] == 40
+    assert usage["total_tokens"] == 160
+    assert usage["cost_usd"] is not None and usage["cost_usd"] > 0
+    assert usage["latency_ms"] >= 0
 
 
 @pytest.mark.anyio
