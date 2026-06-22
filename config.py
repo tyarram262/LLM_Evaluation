@@ -1,3 +1,4 @@
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -21,6 +22,17 @@ class Settings(BaseSettings):
     # Observability
     log_level: str = "INFO"
     sentry_dsn: str = ""  # set to enable Sentry error tracking
+
+    @field_validator("database_url")
+    @classmethod
+    def _normalize_db_url(cls, v: str) -> str:
+        # Managed Postgres providers (Render, Heroku) hand out postgres:// or
+        # postgresql:// URLs, but our async engine needs the asyncpg driver.
+        if v.startswith("postgres://"):
+            return v.replace("postgres://", "postgresql+asyncpg://", 1)
+        if v.startswith("postgresql://"):
+            return v.replace("postgresql://", "postgresql+asyncpg://", 1)
+        return v
 
     @property
     def valid_api_keys(self) -> set[str]:
